@@ -5,3 +5,7 @@
 /sync-users
 /maya-golang*
 *.exe
+
+# Web UI
+node_modules/
+/web/dist/

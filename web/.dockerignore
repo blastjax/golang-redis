@@ -1,0 +1,3 @@
+# Installed fresh inside the image, for Linux rather than the host's platform
+node_modules
+dist
