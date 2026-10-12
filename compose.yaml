@@ -1,0 +1,20 @@
+# PostgreSQL and Redis for local development: docker compose up -d --wait
+# DB_USER, DB_NAME, DB_PORT and REDIS_PORT are read from .env, so the app and compose agree.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_DB: ${DB_NAME:-github_users}
+      POSTGRES_HOST_AUTH_METHOD: trust # no password, matching the empty DB_PASSWORD default; local use only
+    ports:
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "${DB_USER:-postgres}", "-d", "${DB_NAME:-github_users}"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"

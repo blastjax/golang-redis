@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -31,13 +33,9 @@ type DatabaseConfig struct {
 
 // GitHubConfig holds GitHub API-related configuration
 type GitHubConfig struct {
-	Token            string
-	BaseURL          string
-	APIVersion       string
-	MaxWorkers       int
-	RateLimitDelay   time.Duration
-	MaxRetries       int
-	RetryBackoffBase time.Duration
+	Token      string
+	BaseURL    string
+	APIVersion string
 }
 
 // RedisConfig holds Redis-related configuration
@@ -58,7 +56,6 @@ type APIConfig struct {
 // AppConfig holds general application configuration
 type AppConfig struct {
 	Environment string
-	LogLevel    string
 }
 
 // Load loads configuration from environment variables
@@ -69,21 +66,17 @@ func Load() (*Config, error) {
 	config := &Config{
 		Database: DatabaseConfig{
 			Host:               getEnv("DB_HOST", "localhost"),
-			Port:               getEnvAsInt("DB_PORT", 3306),
-			User:               getEnv("DB_USER", "root"),
+			Port:               getEnvAsInt("DB_PORT", 5432),
+			User:               getEnv("DB_USER", "postgres"),
 			Password:           getEnv("DB_PASSWORD", ""),
 			Name:               getEnv("DB_NAME", "github_users"),
 			MaxConnections:     getEnvAsInt("DB_MAX_CONNECTIONS", 10),
 			MaxIdleConnections: getEnvAsInt("DB_MAX_IDLE_CONNECTIONS", 5),
 		},
 		GitHub: GitHubConfig{
-			Token:            getEnv("GITHUB_TOKEN", ""),
-			BaseURL:          getEnv("GITHUB_API_BASE_URL", "https://api.github.com"),
-			APIVersion:       getEnv("GITHUB_API_VERSION", "2022-11-28"),
-			MaxWorkers:       getEnvAsInt("GITHUB_MAX_WORKERS", 5),
-			RateLimitDelay:   time.Duration(getEnvAsInt("GITHUB_RATE_LIMIT_DELAY_MS", 1000)) * time.Millisecond,
-			MaxRetries:       getEnvAsInt("GITHUB_MAX_RETRIES", 3),
-			RetryBackoffBase: time.Duration(getEnvAsInt("GITHUB_RETRY_BACKOFF_MS", 500)) * time.Millisecond,
+			Token:      getEnv("GITHUB_TOKEN", ""),
+			BaseURL:    getEnv("GITHUB_API_BASE_URL", "https://api.github.com"),
+			APIVersion: getEnv("GITHUB_API_VERSION", "2022-11-28"),
 		},
 		Redis: RedisConfig{
 			Host:     getEnv("REDIS_HOST", "localhost"),
@@ -98,7 +91,6 @@ func Load() (*Config, error) {
 		},
 		App: AppConfig{
 			Environment: getEnv("APP_ENV", "development"),
-			LogLevel:    getEnv("LOG_LEVEL", "info"),
 		},
 	}
 
@@ -123,10 +115,17 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// GetDSN returns the database connection string
+// GetDSN returns the PostgreSQL connection URL. url.UserPassword escapes special
+// characters in the credentials. With no sslmode in the URL, pgx tries TLS first and
+// falls back to an unencrypted connection; set PGSSLMODE=require to insist on TLS.
 func (c *DatabaseConfig) GetDSN() string {
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-		c.User, c.Password, c.Host, c.Port, c.Name)
+	dsn := url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(c.User, c.Password),
+		Host:   net.JoinHostPort(c.Host, strconv.Itoa(c.Port)),
+		Path:   "/" + c.Name,
+	}
+	return dsn.String()
 }
 
 // getEnv gets an environment variable with a fallback value

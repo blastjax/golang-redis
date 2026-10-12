@@ -8,10 +8,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/blastjax/maya-golang/internal/api"
-	"github.com/blastjax/maya-golang/internal/config"
-	"github.com/blastjax/maya-golang/internal/database"
-	"github.com/blastjax/maya-golang/internal/github"
+	"github.com/blastjax/golang-redis/internal/api"
+	"github.com/blastjax/golang-redis/internal/config"
+	"github.com/blastjax/golang-redis/internal/database"
+	"github.com/blastjax/golang-redis/internal/github"
 )
 
 func main() {
@@ -40,47 +40,36 @@ func main() {
 		serveCommand(cfg)
 	case "help", "--help", "-h":
 		printUsage()
-		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
 		printUsage()
 		os.Exit(1)
 	}
+}
 
+// newFlagSet creates the flags for a subcommand. Its -h output is generated from
+// the flag definitions, so it can't drift from them.
+func newFlagSet(name, description string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: %s %s [options]\n\n%s\n\n", os.Args[0], name, description)
+		fs.PrintDefaults()
+	}
+	return fs
 }
 
 func syncUsersCommand(cfg *config.Config) {
-	// Create a new FlagSet for the sync-users subcommand
-	syncUsersCmd := flag.NewFlagSet("sync-users", flag.ExitOnError)
-
-	var (
-		count      = syncUsersCmd.Int("count", 30, "Number of users to fetch (max 1000)")
-		since      = syncUsersCmd.Int("since", 0, "User ID to start from (0 = auto-detect)")
-		format     = syncUsersCmd.String("format", "table", "Output format: table, json, detailed")
-		store      = syncUsersCmd.Bool("store", false, "Store users in database")
-		concurrent = syncUsersCmd.Bool("concurrent", true, "Use concurrent fetching (recommended for large counts)")
-		help       = syncUsersCmd.Bool("help", false, "Show help message")
-	)
-
-	syncUsersCmd.Usage = func() {
-		printSyncUsersUsage()
-	}
-
-	// Parse the arguments starting from position 2 (after sync-users)
-	syncUsersCmd.Parse(os.Args[2:])
-
-	if *help {
-		printSyncUsersUsage()
-		os.Exit(0)
-	}
+	fs := newFlagSet("sync-users", "Fetches users from the GitHub Users REST API, optionally storing them in PostgreSQL")
+	count := fs.Int("count", 30, "Number of users to fetch")
+	since := fs.Int("since", 0, "Fetch users with an ID greater than this (0 with -store: continue after the last stored user)")
+	format := fs.String("format", "table", "Output format: table, json, detailed")
+	store := fs.Bool("store", false, "Store users in the database")
+	fs.Parse(os.Args[2:])
 
 	// Initialize database if storing users
-	var db *database.DB
 	var userRepo *database.UserRepository
-
 	if *store {
-		var err error
-		db, err = database.New(&cfg.Database)
+		db, err := database.New(&cfg.Database)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error connecting to database: %v\n", err)
 			os.Exit(1)
@@ -100,40 +89,16 @@ func syncUsersCommand(cfg *config.Config) {
 		}
 	}
 
-	var users []github.User
-	var err error
-
 	startTime := time.Now()
 
-	if *concurrent && *count > 30 {
-		// Use concurrent client for larger requests
-		concurrentClient := github.NewConcurrentClient(&cfg.GitHub)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-
-		log.Printf("Using concurrent fetching with %d workers for %d users",
-			cfg.GitHub.MaxWorkers, *count)
-
-		users, err = concurrentClient.FetchUsersConcurrently(ctx, *count, *since)
-	} else {
-		// Use sequential client for smaller requests or when concurrent is disabled
-		client := github.NewClient(&cfg.GitHub)
-
-		if *count <= 30 {
-			users, err = client.FetchUsers(*count, *since)
-		} else {
-			users, err = client.FetchAllUsers(*count)
-		}
-	}
-
-	fetchDuration := time.Since(startTime)
-
+	users, err := github.NewClient(&cfg.GitHub).FetchAllUsers(context.Background(), *count, *since)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching users: %v\n", err)
 		os.Exit(1)
 	}
 
-	log.Printf("Fetched %d users in %v", len(users), fetchDuration)
+	// Status messages go to stderr (log) so -format json output stays valid JSON
+	log.Printf("Fetched %d users in %v", len(users), time.Since(startTime))
 
 	// Store users in database if requested
 	if *store && len(users) > 0 {
@@ -141,7 +106,7 @@ func syncUsersCommand(cfg *config.Config) {
 			fmt.Fprintf(os.Stderr, "Error storing users: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Stored %d users in database\n", len(users))
+		log.Printf("Stored %d users in database", len(users))
 	}
 
 	// Display users
@@ -152,27 +117,11 @@ func syncUsersCommand(cfg *config.Config) {
 }
 
 func listUsersCommand(cfg *config.Config) {
-	// Create a new FlagSet for the list-users subcommand
-	listUsersCmd := flag.NewFlagSet("list-users", flag.ExitOnError)
-
-	var (
-		limit  = listUsersCmd.Int("limit", 30, "Number of users to list")
-		offset = listUsersCmd.Int("offset", 0, "Offset for pagination")
-		format = listUsersCmd.String("format", "table", "Output format: table, json, detailed")
-		help   = listUsersCmd.Bool("help", false, "Show help message")
-	)
-
-	listUsersCmd.Usage = func() {
-		printListUsersUsage()
-	}
-
-	// Parse the arguments starting from position 2 (after list-users)
-	listUsersCmd.Parse(os.Args[2:])
-
-	if *help {
-		printListUsersUsage()
-		os.Exit(0)
-	}
+	fs := newFlagSet("list-users", "Lists users from the PostgreSQL database")
+	limit := fs.Int("limit", 30, "Number of users to list")
+	offset := fs.Int("offset", 0, "Offset for pagination")
+	format := fs.String("format", "table", "Output format: table, json, detailed")
+	fs.Parse(os.Args[2:])
 
 	// Connect to database
 	db, err := database.New(&cfg.Database)
@@ -198,7 +147,7 @@ func listUsersCommand(cfg *config.Config) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Showing %d of %d total users (offset: %d)\n\n", len(users), total, *offset)
+	log.Printf("Showing %d of %d total users (offset: %d)", len(users), total, *offset)
 
 	// Display users
 	if err := displayUsers(users, *format); err != nil {
@@ -208,24 +157,7 @@ func listUsersCommand(cfg *config.Config) {
 }
 
 func setupDBCommand(cfg *config.Config) {
-	// Create a new FlagSet for the setup-db subcommand
-	setupDBCmd := flag.NewFlagSet("setup-db", flag.ExitOnError)
-
-	var (
-		help = setupDBCmd.Bool("help", false, "Show help message")
-	)
-
-	setupDBCmd.Usage = func() {
-		printSetupDBUsage()
-	}
-
-	// Parse the arguments starting from position 2 (after setup-db)
-	setupDBCmd.Parse(os.Args[2:])
-
-	if *help {
-		printSetupDBUsage()
-		os.Exit(0)
-	}
+	newFlagSet("setup-db", "Initializes the PostgreSQL database schema for storing GitHub users").Parse(os.Args[2:])
 
 	// Connect to database
 	db, err := database.New(&cfg.Database)
@@ -245,24 +177,7 @@ func setupDBCommand(cfg *config.Config) {
 }
 
 func serveCommand(cfg *config.Config) {
-	// Create a new FlagSet for the serve subcommand
-	serveCmd := flag.NewFlagSet("serve", flag.ExitOnError)
-
-	var (
-		help = serveCmd.Bool("help", false, "Show help message")
-	)
-
-	serveCmd.Usage = func() {
-		printServeUsage()
-	}
-
-	// Parse the arguments starting from position 2 (after serve)
-	serveCmd.Parse(os.Args[2:])
-
-	if *help {
-		printServeUsage()
-		os.Exit(0)
-	}
+	newFlagSet("serve", "Starts the REST API server (endpoints and settings are listed in README.md)").Parse(os.Args[2:])
 
 	// Create and start the API server
 	server, err := api.NewServer(cfg)
@@ -280,79 +195,19 @@ func serveCommand(cfg *config.Config) {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, "GitHub Users CLI Tool\n\n")
-	fmt.Fprintf(os.Stderr, "Usage: %s <command> [options]\n\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "Commands:\n")
-	fmt.Fprintf(os.Stderr, "  sync-users    Fetch users from GitHub API\n")
-	fmt.Fprintf(os.Stderr, "  list-users    List users from database\n")
-	fmt.Fprintf(os.Stderr, "  setup-db      Initialize database schema\n")
-	fmt.Fprintf(os.Stderr, "  serve         Start REST API server\n")
-	fmt.Fprintf(os.Stderr, "  help          Show this help message\n")
-	fmt.Fprintf(os.Stderr, "\nUse '%s <command> --help' for more information about a command.\n", os.Args[0])
-}
+	fmt.Fprintf(os.Stderr, `GitHub Users CLI Tool
 
-func printSyncUsersUsage() {
-	fmt.Fprintf(os.Stderr, "Usage: %s sync-users [options]\n\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "Fetches users from GitHub Users REST API (v2022-11-28) with concurrent processing\n\n")
-	fmt.Fprintf(os.Stderr, "Options:\n")
-	fmt.Fprintf(os.Stderr, "  -count int\n")
-	fmt.Fprintf(os.Stderr, "        Number of users to fetch (max 1000) (default 30)\n")
-	fmt.Fprintf(os.Stderr, "  -concurrent\n")
-	fmt.Fprintf(os.Stderr, "        Use concurrent fetching with worker pools (default true)\n")
-	fmt.Fprintf(os.Stderr, "  -format string\n")
-	fmt.Fprintf(os.Stderr, "        Output format: table, json, detailed (default \"table\")\n")
-	fmt.Fprintf(os.Stderr, "  -since int\n")
-	fmt.Fprintf(os.Stderr, "        User ID to start from (0 = auto-detect when storing) (default 0)\n")
-	fmt.Fprintf(os.Stderr, "  -store\n")
-	fmt.Fprintf(os.Stderr, "        Store users in MySQL database\n")
-	fmt.Fprintf(os.Stderr, "  -help\n")
-	fmt.Fprintf(os.Stderr, "        Show help message\n")
-	fmt.Fprintf(os.Stderr, "\nConcurrency Configuration (via environment variables):\n")
-	fmt.Fprintf(os.Stderr, "  GITHUB_MAX_WORKERS=5              Number of concurrent workers\n")
-	fmt.Fprintf(os.Stderr, "  GITHUB_RATE_LIMIT_DELAY_MS=1000   Delay between API calls (ms)\n")
-	fmt.Fprintf(os.Stderr, "  GITHUB_MAX_RETRIES=3              Max retries for failed requests\n")
-	fmt.Fprintf(os.Stderr, "  GITHUB_RETRY_BACKOFF_MS=500       Base backoff time for retries (ms)\n")
-}
+Usage: %[1]s <command> [options]
 
-func printListUsersUsage() {
-	fmt.Fprintf(os.Stderr, "Usage: %s list-users [options]\n\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "Lists users from the MySQL database\n\n")
-	fmt.Fprintf(os.Stderr, "Options:\n")
-	fmt.Fprintf(os.Stderr, "  -limit int\n")
-	fmt.Fprintf(os.Stderr, "        Number of users to display (default 30)\n")
-	fmt.Fprintf(os.Stderr, "  -offset int\n")
-	fmt.Fprintf(os.Stderr, "        Offset for pagination (default 0)\n")
-	fmt.Fprintf(os.Stderr, "  -format string\n")
-	fmt.Fprintf(os.Stderr, "        Output format: table, json, detailed (default \"table\")\n")
-	fmt.Fprintf(os.Stderr, "  -help\n")
-	fmt.Fprintf(os.Stderr, "        Show help message\n")
-}
+Commands:
+  sync-users    Fetch users from GitHub API
+  list-users    List users from database
+  setup-db      Initialize database schema
+  serve         Start REST API server
+  help          Show this help message
 
-func printSetupDBUsage() {
-	fmt.Fprintf(os.Stderr, "Usage: %s setup-db\n\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "Initializes the MySQL database schema for storing GitHub users\n\n")
-	fmt.Fprintf(os.Stderr, "Options:\n")
-	fmt.Fprintf(os.Stderr, "  -help\n")
-	fmt.Fprintf(os.Stderr, "        Show help message\n")
-}
-
-func printServeUsage() {
-	fmt.Fprintf(os.Stderr, "Usage: %s serve [options]\n\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "Starts the REST API server for GitHub Users management\n\n")
-	fmt.Fprintf(os.Stderr, "API Endpoints:\n")
-	fmt.Fprintf(os.Stderr, "  GET    /users              List all users from database (with pagination)\n")
-	fmt.Fprintf(os.Stderr, "  GET    /users/:username    Get specific user (Redis cache + GitHub fallback)\n")
-	fmt.Fprintf(os.Stderr, "  PUT    /users/:username    Update user details in database and cache\n")
-	fmt.Fprintf(os.Stderr, "  DELETE /users/:username    Delete user from database and cache\n")
-	fmt.Fprintf(os.Stderr, "  GET    /health             Health check endpoint\n")
-	fmt.Fprintf(os.Stderr, "\nOptions:\n")
-	fmt.Fprintf(os.Stderr, "  -help\n")
-	fmt.Fprintf(os.Stderr, "        Show help message\n")
-	fmt.Fprintf(os.Stderr, "\nServer Configuration (via environment variables):\n")
-	fmt.Fprintf(os.Stderr, "  API_HOST=localhost        Server host address\n")
-	fmt.Fprintf(os.Stderr, "  API_PORT=8080             Server port\n")
-	fmt.Fprintf(os.Stderr, "  REDIS_HOST=localhost      Redis cache host\n")
-	fmt.Fprintf(os.Stderr, "  REDIS_TTL_SECONDS=30      Cache TTL in seconds\n")
+Use '%[1]s <command> -h' for more information about a command.
+`, os.Args[0])
 }
 
 func displayUsers(users []github.User, format string) error {

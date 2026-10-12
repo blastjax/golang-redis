@@ -11,11 +11,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/blastjax/maya-golang/internal/github"
+	"github.com/blastjax/golang-redis/internal/cache"
+	"github.com/blastjax/golang-redis/internal/github"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // Mock implementations
@@ -41,6 +43,11 @@ func (m *MockUserRepository) GetUserByUsername(username string) (*github.User, e
 	return args.Get(0).(*github.User), args.Error(1)
 }
 
+func (m *MockUserRepository) CreateUser(user *github.User) error {
+	args := m.Called(user)
+	return args.Error(0)
+}
+
 func (m *MockUserRepository) UpdateUser(user *github.User) error {
 	args := m.Called(user)
 	return args.Error(0)
@@ -48,34 +55,6 @@ func (m *MockUserRepository) UpdateUser(user *github.User) error {
 
 func (m *MockUserRepository) DeleteUser(username string) error {
 	args := m.Called(username)
-	return args.Error(0)
-}
-
-func (m *MockUserRepository) InsertUser(user *github.User) error {
-	args := m.Called(user)
-	return args.Error(0)
-}
-
-func (m *MockUserRepository) InsertUsers(users []github.User) error {
-	args := m.Called(users)
-	return args.Error(0)
-}
-
-func (m *MockUserRepository) GetUser(id int) (*github.User, error) {
-	args := m.Called(id)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
-	}
-	return args.Get(0).(*github.User), args.Error(1)
-}
-
-func (m *MockUserRepository) GetLastSyncedUserID() (int, error) {
-	args := m.Called()
-	return args.Int(0), args.Error(1)
-}
-
-func (m *MockUserRepository) CreateUser(user *github.User) error {
-	args := m.Called(user)
 	return args.Error(0)
 }
 
@@ -101,31 +80,16 @@ func (m *MockRedisClient) DeleteUser(ctx context.Context, username string) error
 	return args.Error(0)
 }
 
-func (m *MockRedisClient) UpdateUserInCache(ctx context.Context, username string, user *github.User) error {
-	args := m.Called(ctx, username, user)
-	return args.Error(0)
-}
-
-func (m *MockRedisClient) Close() error {
-	args := m.Called()
-	return args.Error(0)
-}
-
 type MockGitHubClient struct {
 	mock.Mock
 }
 
-func (m *MockGitHubClient) GetUserByUsername(username string) (*github.User, error) {
-	args := m.Called(username)
+func (m *MockGitHubClient) GetUserByUsername(ctx context.Context, username string) (*github.User, error) {
+	args := m.Called(ctx, username)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(*github.User), args.Error(1)
-}
-
-func (m *MockGitHubClient) FetchUsers(perPage, since int) ([]github.User, error) {
-	args := m.Called(perPage, since)
-	return args.Get(0).([]github.User), args.Error(1)
 }
 
 // Helper functions
@@ -281,95 +245,126 @@ func TestHandlers_ListUsers(t *testing.T) {
 func TestHandlers_GetUser(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
+	user := createTestUser(1, "testuser")
+
 	tests := []struct {
 		name                string
-		username            string
-		mockCachedUser      *github.User
-		mockCacheError      error
-		mockGitHubUser      *github.User
-		mockGitHubError     error
-		mockSetCacheError   error
+		path                string
+		setup               func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient)
 		expectedStatus      int
 		expectedSource      string
 		expectedCacheStatus string
 	}{
 		{
-			name:                "cache hit",
-			username:            "testuser",
-			mockCachedUser:      createTestUser(1, "testuser"),
+			name: "cache hit",
+			path: "/users/testuser",
+			setup: func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient) {
+				rc.On("GetUser", mock.Anything, "testuser").Return(user, nil)
+			},
 			expectedStatus:      http.StatusOK,
 			expectedSource:      "cache",
 			expectedCacheStatus: "hit",
 		},
 		{
-			name:                "cache miss, GitHub success",
-			username:            "testuser",
-			mockCachedUser:      nil,
-			mockGitHubUser:      createTestUser(1, "testuser"),
+			name: "cached as not found",
+			path: "/users/ghost",
+			setup: func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient) {
+				rc.On("GetUser", mock.Anything, "ghost").Return(nil, cache.ErrNotFound)
+			},
+			expectedStatus:      http.StatusNotFound,
+			expectedCacheStatus: "hit",
+		},
+		{
+			name: "cache miss, found in database",
+			path: "/users/testuser",
+			setup: func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient) {
+				rc.On("GetUser", mock.Anything, "testuser").Return(nil, nil)
+				repo.On("GetUserByUsername", "testuser").Return(user, nil)
+				rc.On("SetUser", mock.Anything, "testuser", user).Return(nil)
+			},
+			expectedStatus:      http.StatusOK,
+			expectedSource:      "database",
+			expectedCacheStatus: "miss",
+		},
+		{
+			name: "not in database, found on GitHub",
+			path: "/users/testuser",
+			setup: func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient) {
+				rc.On("GetUser", mock.Anything, "testuser").Return(nil, nil)
+				repo.On("GetUserByUsername", "testuser").Return(nil, fmt.Errorf("failed to get user testuser: %w", gorm.ErrRecordNotFound))
+				gh.On("GetUserByUsername", mock.Anything, "testuser").Return(user, nil)
+				rc.On("SetUser", mock.Anything, "testuser", user).Return(nil)
+			},
 			expectedStatus:      http.StatusOK,
 			expectedSource:      "github",
 			expectedCacheStatus: "miss",
 		},
 		{
-			name:                "cache miss, user not found",
-			username:            "nonexistent",
-			mockCachedUser:      nil,
-			mockGitHubError:     fmt.Errorf("user not found"),
+			name: "not found anywhere caches the miss",
+			path: "/users/ghost",
+			setup: func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient) {
+				rc.On("GetUser", mock.Anything, "ghost").Return(nil, nil)
+				repo.On("GetUserByUsername", "ghost").Return(nil, gorm.ErrRecordNotFound)
+				gh.On("GetUserByUsername", mock.Anything, "ghost").Return(nil, github.ErrNotFound)
+				rc.On("SetUser", mock.Anything, "ghost", (*github.User)(nil)).Return(nil)
+			},
 			expectedStatus:      http.StatusNotFound,
 			expectedCacheStatus: "miss",
 		},
 		{
-			name:                "cache miss, GitHub error",
-			username:            "testuser",
-			mockCachedUser:      nil,
-			mockGitHubError:     fmt.Errorf("GitHub API error"),
+			name: "GitHub error",
+			path: "/users/testuser",
+			setup: func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient) {
+				rc.On("GetUser", mock.Anything, "testuser").Return(nil, nil)
+				repo.On("GetUserByUsername", "testuser").Return(nil, gorm.ErrRecordNotFound)
+				gh.On("GetUserByUsername", mock.Anything, "testuser").Return(nil, fmt.Errorf("GitHub API error (500)"))
+			},
 			expectedStatus:      http.StatusInternalServerError,
 			expectedCacheStatus: "miss",
 		},
 		{
-			name:           "missing username parameter",
-			username:       "",
-			expectedStatus: http.StatusNotFound, // Route doesn't match when username is empty
+			name: "database error does not fall back to GitHub",
+			path: "/users/testuser",
+			setup: func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient) {
+				rc.On("GetUser", mock.Anything, "testuser").Return(nil, nil)
+				repo.On("GetUserByUsername", "testuser").Return(nil, fmt.Errorf("connection refused"))
+			},
+			expectedStatus:      http.StatusInternalServerError,
+			expectedCacheStatus: "miss",
 		},
 		{
-			name:                "cache error (continue to GitHub)",
-			username:            "testuser",
-			mockCacheError:      fmt.Errorf("Redis error"),
-			mockGitHubUser:      createTestUser(1, "testuser"),
+			name: "cache error falls through to database",
+			path: "/users/testuser",
+			setup: func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient) {
+				rc.On("GetUser", mock.Anything, "testuser").Return(nil, fmt.Errorf("Redis error"))
+				repo.On("GetUserByUsername", "testuser").Return(user, nil)
+				rc.On("SetUser", mock.Anything, "testuser", user).Return(nil)
+			},
 			expectedStatus:      http.StatusOK,
-			expectedSource:      "github",
+			expectedSource:      "database",
 			expectedCacheStatus: "miss",
+		},
+		{
+			name:           "invalid username",
+			path:           "/users/bad%3Fname",
+			setup:          func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient) {},
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "missing username parameter",
+			path:           "/users/",
+			setup:          func(repo *MockUserRepository, rc *MockRedisClient, gh *MockGitHubClient) {},
+			expectedStatus: http.StatusNotFound, // Route doesn't match when username is empty
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handlers, _, mockRedisClient, mockGitHubClient := setupTestHandlers()
-
-			// Setup expectations
-			if tt.username != "" {
-				mockRedisClient.On("GetUser", mock.Anything, tt.username).Return(tt.mockCachedUser, tt.mockCacheError)
-
-				// If cache miss or cache error, expect GitHub call
-				if tt.mockCachedUser == nil {
-					mockGitHubClient.On("GetUserByUsername", tt.username).Return(tt.mockGitHubUser, tt.mockGitHubError)
-
-					// If GitHub success, expect cache set
-					if tt.mockGitHubUser != nil && tt.mockGitHubError == nil {
-						mockRedisClient.On("SetUser", mock.Anything, tt.username, tt.mockGitHubUser).Return(tt.mockSetCacheError)
-					}
-				}
-			}
+			handlers, mockUserRepo, mockRedisClient, mockGitHubClient := setupTestHandlers()
+			tt.setup(mockUserRepo, mockRedisClient, mockGitHubClient)
 
 			// Create request
-			url := "/users/testuser"
-			if tt.username == "" {
-				url = "/users/"
-			} else if tt.username != "testuser" {
-				url = "/users/" + tt.username
-			}
-
-			req := httptest.NewRequest("GET", url, nil)
+			req := httptest.NewRequest("GET", tt.path, nil)
 			w := httptest.NewRecorder()
 
 			// Create Gin context
@@ -379,10 +374,7 @@ func TestHandlers_GetUser(t *testing.T) {
 
 			// Assert response
 			assert.Equal(t, tt.expectedStatus, w.Code)
-
-			if tt.expectedCacheStatus != "" {
-				assert.Equal(t, tt.expectedCacheStatus, w.Header().Get("X-Cache-Status"))
-			}
+			assert.Equal(t, tt.expectedCacheStatus, w.Header().Get("X-Cache-Status"))
 
 			if tt.expectedStatus == http.StatusOK {
 				var response map[string]interface{}
@@ -393,6 +385,8 @@ func TestHandlers_GetUser(t *testing.T) {
 				assert.NotNil(t, response["user"])
 			}
 
+			// Unexpected calls panic; this catches expected calls that never happened
+			mockUserRepo.AssertExpectations(t)
 			mockRedisClient.AssertExpectations(t)
 			mockGitHubClient.AssertExpectations(t)
 		})
@@ -409,7 +403,7 @@ func TestHandlers_UpdateUser(t *testing.T) {
 		mockUser             *github.User
 		mockGetUserError     error
 		mockUpdateUserError  error
-		mockUpdateCacheError error
+		mockDeleteCacheError error
 		expectedStatus       int
 	}{
 		{
@@ -423,12 +417,22 @@ func TestHandlers_UpdateUser(t *testing.T) {
 			expectedStatus: http.StatusOK,
 		},
 		{
+			name:     "cache delete error (should not fail request)",
+			username: "testuser",
+			requestBody: UserUpdateRequest{
+				Name: stringPtr("Updated Name"),
+			},
+			mockUser:             createTestUser(1, "testuser"),
+			mockDeleteCacheError: fmt.Errorf("Redis error"),
+			expectedStatus:       http.StatusOK,
+		},
+		{
 			name:     "user not found",
 			username: "nonexistent",
 			requestBody: UserUpdateRequest{
 				Name: stringPtr("Updated Name"),
 			},
-			mockGetUserError: fmt.Errorf("user not found"),
+			mockGetUserError: fmt.Errorf("failed to get user nonexistent: %w", gorm.ErrRecordNotFound),
 			expectedStatus:   http.StatusNotFound,
 		},
 		{
@@ -482,7 +486,7 @@ func TestHandlers_UpdateUser(t *testing.T) {
 					mockUserRepo.On("UpdateUser", mock.AnythingOfType("*github.User")).Return(tt.mockUpdateUserError)
 
 					if tt.mockUpdateUserError == nil {
-						mockRedisClient.On("UpdateUserInCache", mock.Anything, tt.username, mock.AnythingOfType("*github.User")).Return(tt.mockUpdateCacheError)
+						mockRedisClient.On("DeleteUser", mock.Anything, tt.username).Return(tt.mockDeleteCacheError)
 					}
 				}
 			}
@@ -524,6 +528,11 @@ func TestHandlers_UpdateUser(t *testing.T) {
 
 				assert.Equal(t, "User updated successfully", response["message"])
 				assert.NotNil(t, response["user"])
+
+				// Check for cache delete error header
+				if tt.mockDeleteCacheError != nil {
+					assert.Equal(t, "true", w.Header().Get("X-Cache-Delete-Error"))
+				}
 			}
 
 			mockUserRepo.AssertExpectations(t)
@@ -553,7 +562,7 @@ func TestHandlers_DeleteUser(t *testing.T) {
 		{
 			name:             "user not found",
 			username:         "nonexistent",
-			mockGetUserError: fmt.Errorf("user not found"),
+			mockGetUserError: fmt.Errorf("failed to get user nonexistent: %w", gorm.ErrRecordNotFound),
 			expectedStatus:   http.StatusNotFound,
 		},
 		{
@@ -633,6 +642,110 @@ func TestHandlers_DeleteUser(t *testing.T) {
 
 				// Check for cache delete error header
 				if tt.mockDeleteCacheError != nil {
+					assert.Equal(t, "true", w.Header().Get("X-Cache-Delete-Error"))
+				}
+			}
+
+			mockUserRepo.AssertExpectations(t)
+			mockRedisClient.AssertExpectations(t)
+		})
+	}
+}
+
+func TestHandlers_CreateUser(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	validBody := `{"id": 1, "login": "newuser", "type": "User", "name": "New User"}`
+
+	tests := []struct {
+		name            string
+		body            string
+		expectCreate    bool
+		mockCreateError error
+		mockCacheError  error
+		expectedStatus  int
+	}{
+		{
+			name:           "successful create",
+			body:           validBody,
+			expectCreate:   true,
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "cache delete error (should not fail request)",
+			body:           validBody,
+			expectCreate:   true,
+			mockCacheError: fmt.Errorf("Redis error"),
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:            "duplicate id or login",
+			body:            validBody,
+			expectCreate:    true,
+			mockCreateError: fmt.Errorf("failed to create user newuser: %w", gorm.ErrDuplicatedKey),
+			expectedStatus:  http.StatusConflict,
+		},
+		{
+			name:            "database error",
+			body:            validBody,
+			expectCreate:    true,
+			mockCreateError: fmt.Errorf("database error"),
+			expectedStatus:  http.StatusInternalServerError,
+		},
+		{
+			name:           "missing required field",
+			body:           `{"id": 1, "login": "newuser"}`,
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "invalid login",
+			body:           `{"id": 1, "login": "bad/login", "type": "User"}`,
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "invalid JSON",
+			body:           "invalid json",
+			expectedStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handlers, mockUserRepo, mockRedisClient, _ := setupTestHandlers()
+
+			// Setup expectations
+			if tt.expectCreate {
+				mockUserRepo.On("CreateUser", mock.AnythingOfType("*github.User")).Return(tt.mockCreateError)
+
+				if tt.mockCreateError == nil {
+					mockRedisClient.On("DeleteUser", mock.Anything, "newuser").Return(tt.mockCacheError)
+				}
+			}
+
+			// Create request
+			req := httptest.NewRequest("POST", "/users", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			// Create Gin context
+			router := gin.New()
+			router.POST("/users", handlers.CreateUser)
+			router.ServeHTTP(w, req)
+
+			// Assert response
+			assert.Equal(t, tt.expectedStatus, w.Code)
+
+			if tt.expectedStatus == http.StatusCreated {
+				var response map[string]interface{}
+				err := json.Unmarshal(w.Body.Bytes(), &response)
+				require.NoError(t, err)
+
+				assert.Equal(t, "User created successfully", response["message"])
+				user := response["user"].(map[string]interface{})
+				assert.Equal(t, "newuser", user["login"])
+
+				// Check for cache delete error header
+				if tt.mockCacheError != nil {
 					assert.Equal(t, "true", w.Header().Get("X-Cache-Delete-Error"))
 				}
 			}

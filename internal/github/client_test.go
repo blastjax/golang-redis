@@ -1,14 +1,16 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/blastjax/maya-golang/internal/config"
+	"github.com/blastjax/golang-redis/internal/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -30,14 +32,15 @@ func TestNewClient(t *testing.T) {
 
 func TestClient_FetchUsers(t *testing.T) {
 	tests := []struct {
-		name           string
-		perPage        int
-		since          int
-		mockResponse   []User
-		mockStatusCode int
-		mockError      *APIError
-		expectedError  string
-		expectedCount  int
+		name            string
+		perPage         int
+		since           int
+		mockResponse    []User
+		mockStatusCode  int
+		mockError       *APIError
+		expectedPerPage string
+		expectedError   string
+		expectedCount   int
 	}{
 		{
 			name:    "successful fetch with valid parameters",
@@ -47,46 +50,47 @@ func TestClient_FetchUsers(t *testing.T) {
 				{ID: 6, Login: "user6", Type: "User"},
 				{ID: 7, Login: "user7", Type: "User"},
 			},
-			mockStatusCode: http.StatusOK,
-			expectedCount:  2,
+			mockStatusCode:  http.StatusOK,
+			expectedPerPage: "10",
+			expectedCount:   2,
 		},
 		{
-			name:    "successful fetch with zero perPage (should default to maxUsersPerPage)",
+			name:    "zero perPage defaults to maxUsersPerPage",
 			perPage: 0,
-			since:   0,
 			mockResponse: []User{
 				{ID: 1, Login: "user1", Type: "User"},
 			},
-			mockStatusCode: http.StatusOK,
-			expectedCount:  1,
+			mockStatusCode:  http.StatusOK,
+			expectedPerPage: "100",
+			expectedCount:   1,
 		},
 		{
-			name:    "successful fetch with excessive perPage (should cap to maxUsersPerPage)",
-			perPage: 100,
-			since:   0,
+			name:    "excessive perPage is capped to maxUsersPerPage",
+			perPage: 500,
 			mockResponse: []User{
 				{ID: 1, Login: "user1", Type: "User"},
 			},
-			mockStatusCode: http.StatusOK,
-			expectedCount:  1,
+			mockStatusCode:  http.StatusOK,
+			expectedPerPage: "100",
+			expectedCount:   1,
 		},
 		{
 			name:           "API error response",
 			perPage:        10,
-			since:          0,
 			mockStatusCode: http.StatusForbidden,
 			mockError: &APIError{
 				Message:          "API rate limit exceeded",
 				DocumentationURL: "https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting",
 			},
-			expectedError: "GitHub API error (403): API rate limit exceeded",
+			expectedPerPage: "10",
+			expectedError:   "GitHub API error (403): API rate limit exceeded",
 		},
 		{
-			name:           "non-JSON error response",
-			perPage:        10,
-			since:          0,
-			mockStatusCode: http.StatusInternalServerError,
-			expectedError:  "GitHub API error (500): Internal Server Error",
+			name:            "non-JSON error response",
+			perPage:         10,
+			mockStatusCode:  http.StatusInternalServerError,
+			expectedPerPage: "10",
+			expectedError:   "GitHub API error (500): Internal Server Error",
 		},
 	}
 
@@ -102,13 +106,9 @@ func TestClient_FetchUsers(t *testing.T) {
 
 				// Verify query parameters
 				assert.Equal(t, "/users", r.URL.Path)
-				if tt.perPage > 0 && tt.perPage <= maxUsersPerPage {
-					assert.Equal(t, "10", r.URL.Query().Get("per_page"))
-				} else {
-					assert.Equal(t, "30", r.URL.Query().Get("per_page")) // maxUsersPerPage
-				}
+				assert.Equal(t, tt.expectedPerPage, r.URL.Query().Get("per_page"))
 				if tt.since > 0 {
-					assert.Equal(t, "5", r.URL.Query().Get("since"))
+					assert.Equal(t, strconv.Itoa(tt.since), r.URL.Query().Get("since"))
 				}
 
 				w.Header().Set("Content-Type", "application/json")
@@ -133,7 +133,7 @@ func TestClient_FetchUsers(t *testing.T) {
 			client := NewClient(cfg)
 
 			// Execute test
-			users, err := client.FetchUsers(tt.perPage, tt.since)
+			users, err := client.FetchUsers(context.Background(), tt.perPage, tt.since)
 
 			// Assert results
 			if tt.expectedError != "" {
@@ -151,80 +151,53 @@ func TestClient_FetchUsers(t *testing.T) {
 	}
 }
 
+// fakeUsersAPI serves GET /users like GitHub: each page starts after the "since"
+// user ID, and only even IDs up to maxID exist (real GitHub user IDs have gaps too)
+func fakeUsersAPI(maxID int) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		since, _ := strconv.Atoi(r.URL.Query().Get("since"))
+		perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
+
+		users := []User{}
+		for id := since + 1; id <= maxID && len(users) < perPage; id++ {
+			if id%2 == 0 {
+				users = append(users, User{ID: id, Login: fmt.Sprintf("user%d", id), Type: "User"})
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(users)
+	}))
+}
+
 func TestClient_FetchAllUsers(t *testing.T) {
+	server := fakeUsersAPI(1000) // 500 users: IDs 2, 4, ..., 1000
+	defer server.Close()
+
+	client := NewClient(&config.GitHubConfig{BaseURL: server.URL})
+
 	tests := []struct {
 		name          string
 		totalCount    int
-		mockResponses [][]User
+		since         int
 		expectedCount int
-		expectedError string
+		expectedFirst int
 	}{
-		{
-			name:       "fetch exact count",
-			totalCount: 45,
-			mockResponses: [][]User{
-				generateUsers(1, 30),  // First page: 30 users
-				generateUsers(31, 15), // Second page: 15 users
-			},
-			expectedCount: 45,
-		},
-		{
-			name:       "fetch with trimming",
-			totalCount: 25,
-			mockResponses: [][]User{
-				generateUsers(1, 30), // First page: 30 users (will be trimmed to 25)
-			},
-			expectedCount: 25,
-		},
-		{
-			name:       "fetch with empty response",
-			totalCount: 10,
-			mockResponses: [][]User{
-				{}, // Empty response
-			},
-			expectedCount: 0,
-		},
-		{
-			name:       "fetch small count",
-			totalCount: 5,
-			mockResponses: [][]User{
-				generateUsers(1, 5),
-			},
-			expectedCount: 5,
-		},
+		{name: "spans several pages", totalCount: 250, expectedCount: 250, expectedFirst: 2},
+		{name: "starts after since", totalCount: 10, since: 100, expectedCount: 10, expectedFirst: 102},
+		{name: "stops when users run out", totalCount: 600, expectedCount: 500, expectedFirst: 2},
+		{name: "nothing after the last user", totalCount: 10, since: 1000, expectedCount: 0},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			responseIndex := 0
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
+			users, err := client.FetchAllUsers(context.Background(), tt.totalCount, tt.since)
+			require.NoError(t, err)
+			require.Len(t, users, tt.expectedCount)
 
-				if responseIndex < len(tt.mockResponses) {
-					json.NewEncoder(w).Encode(tt.mockResponses[responseIndex])
-					responseIndex++
-				} else {
-					// Return empty array for subsequent requests
-					json.NewEncoder(w).Encode([]User{})
-				}
-			}))
-			defer server.Close()
-
-			cfg := &config.GitHubConfig{
-				BaseURL:    server.URL,
-				APIVersion: "2022-11-28",
-				Token:      "test-token",
-			}
-			client := NewClient(cfg)
-
-			users, err := client.FetchAllUsers(tt.totalCount)
-
-			if tt.expectedError != "" {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.expectedError)
-			} else {
-				assert.NoError(t, err)
-				assert.Len(t, users, tt.expectedCount)
+			// Each page continues after the previous page's last ID: no duplicates, none skipped
+			for i, user := range users {
+				assert.Equal(t, tt.expectedFirst+2*i, user.ID)
 			}
 		})
 	}
@@ -237,6 +210,7 @@ func TestClient_GetUserByUsername(t *testing.T) {
 		mockUser       *User
 		mockStatusCode int
 		mockError      *APIError
+		expectedErr    error
 		expectedError  string
 	}{
 		{
@@ -255,7 +229,13 @@ func TestClient_GetUserByUsername(t *testing.T) {
 			name:           "user not found",
 			username:       "nonexistentuser",
 			mockStatusCode: http.StatusNotFound,
-			expectedError:  "user not found",
+			expectedErr:    ErrNotFound,
+		},
+		{
+			name:           "username is escaped, not sent as a query string",
+			username:       "bad?name",
+			mockStatusCode: http.StatusNotFound,
+			expectedErr:    ErrNotFound,
 		},
 		{
 			name:           "API error",
@@ -280,6 +260,7 @@ func TestClient_GetUserByUsername(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				// Verify request
 				assert.Equal(t, "/users/"+tt.username, r.URL.Path)
+				assert.Empty(t, r.URL.RawQuery)
 				assert.Equal(t, "application/vnd.github+json", r.Header.Get("Accept"))
 				assert.Equal(t, "2022-11-28", r.Header.Get("X-GitHub-Api-Version"))
 				assert.Equal(t, userAgent, r.Header.Get("User-Agent"))
@@ -305,13 +286,17 @@ func TestClient_GetUserByUsername(t *testing.T) {
 			}
 			client := NewClient(cfg)
 
-			user, err := client.GetUserByUsername(tt.username)
+			user, err := client.GetUserByUsername(context.Background(), tt.username)
 
-			if tt.expectedError != "" {
+			switch {
+			case tt.expectedErr != nil:
+				assert.ErrorIs(t, err, tt.expectedErr)
+				assert.Nil(t, user)
+			case tt.expectedError != "":
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), tt.expectedError)
 				assert.Nil(t, user)
-			} else {
+			default:
 				assert.NoError(t, err)
 				require.NotNil(t, user)
 				assert.Equal(t, tt.mockUser.ID, user.ID)
@@ -339,7 +324,7 @@ func TestClient_NetworkError(t *testing.T) {
 	}
 	client := NewClient(cfg)
 
-	users, err := client.FetchUsers(10, 0)
+	users, err := client.FetchUsers(context.Background(), 10, 0)
 	assert.Error(t, err)
 	assert.Nil(t, users)
 	assert.Contains(t, err.Error(), "failed to execute request")
@@ -361,21 +346,8 @@ func TestClient_InvalidJSON(t *testing.T) {
 	}
 	client := NewClient(cfg)
 
-	users, err := client.FetchUsers(10, 0)
+	users, err := client.FetchUsers(context.Background(), 10, 0)
 	assert.Error(t, err)
 	assert.Nil(t, users)
 	assert.Contains(t, err.Error(), "failed to parse JSON response")
-}
-
-// Helper function to generate test users
-func generateUsers(startID, count int) []User {
-	users := make([]User, count)
-	for i := 0; i < count; i++ {
-		users[i] = User{
-			ID:    startID + i,
-			Login: fmt.Sprintf("user%d", startID+i),
-			Type:  "User",
-		}
-	}
-	return users
 }

@@ -1,1 +1,7 @@
 .env
+
+# Built binaries
+/golang-redis
+/sync-users
+/maya-golang*
+*.exe

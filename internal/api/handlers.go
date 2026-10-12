@@ -1,12 +1,16 @@
 package api
 
 import (
+	"errors"
 	"net/http"
+	"regexp"
 	"strconv"
 
-	"github.com/blastjax/maya-golang/internal/github"
+	"github.com/blastjax/golang-redis/internal/cache"
+	"github.com/blastjax/golang-redis/internal/github"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // Handlers contains all the dependencies needed for API handlers
@@ -49,7 +53,23 @@ type UserUpdateRequest struct {
 	Bio      *string `json:"bio,omitempty"`
 }
 
-// ListUsers handles GET /users - List all users from MySQL
+// loginPattern matches GitHub logins, including bot accounts like "dependabot[bot]".
+// Anything else is rejected before it can reach the GitHub URL or a cache key.
+var loginPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,39}(\[bot\])?$`)
+
+// usernameParam returns the :username path parameter, responding 400 if it isn't a valid GitHub login
+func usernameParam(c *gin.Context) (string, bool) {
+	username := c.Param("username")
+	if !loginPattern.MatchString(username) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid username",
+		})
+		return "", false
+	}
+	return username, true
+}
+
+// ListUsers handles GET /users - List all users from the database
 func (h *Handlers) ListUsers(c *gin.Context) {
 	// Parse query parameters for pagination
 	limitStr := c.DefaultQuery("limit", "30")
@@ -99,13 +119,10 @@ func (h *Handlers) ListUsers(c *gin.Context) {
 	})
 }
 
-// GetUser handles GET /users/:username - Get specific user with Redis caching
+// GetUser handles GET /users/:username - Get a user from Redis, then the database, then GitHub
 func (h *Handlers) GetUser(c *gin.Context) {
-	username := c.Param("username")
-	if username == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Username parameter is required",
-		})
+	username, ok := usernameParam(c)
+	if !ok {
 		return
 	}
 
@@ -113,13 +130,18 @@ func (h *Handlers) GetUser(c *gin.Context) {
 
 	// Step 1: Check Redis cache first
 	cachedUser, err := h.redisClient.GetUser(ctx, username)
-	if err != nil {
-		// Log error but continue to GitHub fallback
-		// In production, you might want to use a proper logger
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		// GitHub reported this user missing within the cache TTL
+		c.Header("X-Cache-Status", "hit")
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "User not found",
+		})
+		return
+	case err != nil:
+		// Flag the cache error but continue to the database
 		c.Header("X-Cache-Error", "true")
-	}
-
-	if cachedUser != nil {
+	case cachedUser != nil:
 		// Cache hit - return cached data
 		c.Header("X-Cache-Status", "hit")
 		c.JSON(http.StatusOK, gin.H{
@@ -129,44 +151,50 @@ func (h *Handlers) GetUser(c *gin.Context) {
 		return
 	}
 
-	// Step 2: Cache miss - fetch from GitHub
 	c.Header("X-Cache-Status", "miss")
 
-	// Fetch user from GitHub API
-	githubUser, err := h.fetchUserFromGitHub(username)
-	if err != nil {
-		if err.Error() == "user not found" {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": "User not found",
-			})
-			return
+	// Step 2: Cache miss - check the database, then fall back to GitHub
+	source := "database"
+	user, err := h.userRepo.GetUserByUsername(username)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		source = "github"
+		user, err = h.githubClient.GetUserByUsername(ctx, username)
+	}
+
+	if errors.Is(err, github.ErrNotFound) {
+		// Cache the miss so repeated lookups don't use up the GitHub rate limit
+		if err := h.redisClient.SetUser(ctx, username, nil); err != nil {
+			c.Header("X-Cache-Store-Error", "true")
 		}
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "User not found",
+		})
+		return
+	}
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to fetch user from GitHub",
+			"error": "Failed to fetch user from " + source,
 		})
 		return
 	}
 
 	// Step 3: Store in Redis cache (TTL: 30s by default)
-	if err := h.redisClient.SetUser(ctx, username, githubUser); err != nil {
-		// Log error but don't fail the request
+	if err := h.redisClient.SetUser(ctx, username, user); err != nil {
+		// Flag the error but don't fail the request
 		c.Header("X-Cache-Store-Error", "true")
 	}
 
 	// Return user data
 	c.JSON(http.StatusOK, gin.H{
-		"user":   githubUser,
-		"source": "github",
+		"user":   user,
+		"source": source,
 	})
 }
 
 // UpdateUser handles PUT /users/:username - Update user details
 func (h *Handlers) UpdateUser(c *gin.Context) {
-	username := c.Param("username")
-	if username == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Username parameter is required",
-		})
+	username, ok := usernameParam(c)
+	if !ok {
 		return
 	}
 
@@ -184,7 +212,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	// Step 1: Find user in database by username
 	user, err := h.userRepo.GetUserByUsername(username)
 	if err != nil {
-		if err.Error() == "user not found" {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{
 				"error": "User not found in database",
 			})
@@ -226,7 +254,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 		return
 	}
 
-	// Step 3: Update in MySQL database
+	// Step 3: Update in the database
 	if err := h.userRepo.UpdateUser(user); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to update user in database",
@@ -234,10 +262,10 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 		return
 	}
 
-	// Step 4: Update in Redis cache if cached
-	if err := h.redisClient.UpdateUserInCache(ctx, username, user); err != nil {
-		// Log error but don't fail the request
-		c.Header("X-Cache-Update-Error", "true")
+	// Step 4: Drop the cached copy so the next GET reads the update from the database
+	if err := h.redisClient.DeleteUser(ctx, username); err != nil {
+		// Flag the error but don't fail the request
+		c.Header("X-Cache-Delete-Error", "true")
 	}
 
 	// Return updated user
@@ -247,18 +275,10 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	})
 }
 
-// fetchUserFromGitHub fetches user data from GitHub API
-func (h *Handlers) fetchUserFromGitHub(username string) (*github.User, error) {
-	return h.githubClient.GetUserByUsername(username)
-}
-
 // DeleteUser handles DELETE /users/:username - Delete user from database and cache
 func (h *Handlers) DeleteUser(c *gin.Context) {
-	username := c.Param("username")
-	if username == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Username parameter is required",
-		})
+	username, ok := usernameParam(c)
+	if !ok {
 		return
 	}
 
@@ -267,7 +287,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 	// Step 1: Check if user exists in database
 	user, err := h.userRepo.GetUserByUsername(username)
 	if err != nil {
-		if err.Error() == "user not found" {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{
 				"error": "User not found in database",
 			})
@@ -279,7 +299,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	// Step 2: Delete from MySQL database
+	// Step 2: Delete from the database
 	if err := h.userRepo.DeleteUser(username); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to delete user from database",
@@ -289,7 +309,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 
 	// Step 3: Delete from Redis cache (if cached)
 	if err := h.redisClient.DeleteUser(ctx, username); err != nil {
-		// Log error but don't fail the request since database deletion succeeded
+		// Flag the error but don't fail the request since database deletion succeeded
 		c.Header("X-Cache-Delete-Error", "true")
 	}
 
@@ -311,9 +331,9 @@ func (h *Handlers) HealthCheck(c *gin.Context) {
 	})
 }
 
-// CreateUser handles POST /user - Create user and store to database
+// CreateUser handles POST /users - Create user and store to database
 func (h *Handlers) CreateUser(c *gin.Context) {
-	// Parse JSON payload
+	// Parse JSON payload (binding requires id, login and type)
 	var newUser UserCreateRequest
 	if err := c.ShouldBindJSON(&newUser); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -322,24 +342,14 @@ func (h *Handlers) CreateUser(c *gin.Context) {
 		return
 	}
 
-	// Basic validation
-	if newUser.Login == "" || newUser.ID == 0 {
+	if !loginPattern.MatchString(newUser.Login) {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Both 'id' and 'login' are required",
+			"error": "Invalid login",
 		})
 		return
 	}
 
-	// Step 1: Check if user already exists in DB
-	existingUser, _ := h.userRepo.GetUserByUsername(newUser.Login)
-	if existingUser != nil {
-		c.JSON(http.StatusConflict, gin.H{
-			"error": "User already exists",
-		})
-		return
-	}
-
-	// Step 2: Build new user struct
+	// Step 1: Build new user struct
 	user := &github.User{
 		ID:        newUser.ID,
 		Login:     newUser.Login,
@@ -354,18 +364,23 @@ func (h *Handlers) CreateUser(c *gin.Context) {
 		Bio:       newUser.Bio,
 	}
 
-	// Step 3: Insert into MySQL database
+	// Step 2: Insert into the database; the primary key and unique login reject duplicates
 	if err := h.userRepo.CreateUser(user); err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "User already exists",
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to insert user into database",
 		})
 		return
 	}
 
-	// Step 4: Save to Redis cache (optional)
-	ctx := c.Request.Context()
-	if err := h.redisClient.UpdateUserInCache(ctx, user.Login, user); err != nil {
-		c.Header("X-Cache-Insert-Error", "true")
+	// Step 3: Drop any cached GitHub copy or "not found" entry for this login
+	if err := h.redisClient.DeleteUser(c.Request.Context(), user.Login); err != nil {
+		c.Header("X-Cache-Delete-Error", "true")
 	}
 
 	// Return created user

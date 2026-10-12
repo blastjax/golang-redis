@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/blastjax/maya-golang/internal/cache"
-	"github.com/blastjax/maya-golang/internal/config"
-	"github.com/blastjax/maya-golang/internal/database"
-	"github.com/blastjax/maya-golang/internal/github"
+	"github.com/blastjax/golang-redis/internal/cache"
+	"github.com/blastjax/golang-redis/internal/config"
+	"github.com/blastjax/golang-redis/internal/database"
+	"github.com/blastjax/golang-redis/internal/github"
 
 	"github.com/gin-gonic/gin"
 )
@@ -55,14 +55,8 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	// Create Gin router
-	router := gin.New()
-
-	// Add middleware
-	router.Use(gin.Logger())
-	router.Use(gin.Recovery())
-	router.Use(corsMiddleware())
-	router.Use(requestIDMiddleware())
+	// Create Gin router with request logging and panic recovery
+	router := gin.Default()
 
 	server := &Server{
 		config:      cfg,
@@ -96,6 +90,8 @@ func (s *Server) Start() error {
 	server := &http.Server{
 		Addr:    addr,
 		Handler: s.router,
+		// Drop clients that are too slow to send their headers (slowloris)
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	// Channel to listen for interrupt signals
@@ -145,34 +141,4 @@ func (s *Server) Close() error {
 	}
 
 	return lastErr
-}
-
-// corsMiddleware adds CORS headers
-func corsMiddleware() gin.HandlerFunc {
-	return gin.HandlerFunc(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Credentials", "true")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
-		c.Header("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
-
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
-
-		c.Next()
-	})
-}
-
-// requestIDMiddleware adds a request ID to each request
-func requestIDMiddleware() gin.HandlerFunc {
-	return gin.HandlerFunc(func(c *gin.Context) {
-		requestID := c.GetHeader("X-Request-ID")
-		if requestID == "" {
-			requestID = fmt.Sprintf("%d", time.Now().UnixNano())
-		}
-		c.Header("X-Request-ID", requestID)
-		c.Set("RequestID", requestID)
-		c.Next()
-	})
 }

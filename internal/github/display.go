@@ -24,27 +24,26 @@ func DisplayUsersTable(users []User) error {
 
 	// Create a tab writer for aligned output
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	defer w.Flush()
 
-	// Print header
-	fmt.Fprintln(w, "ID\tLOGIN\tTYPE\tSITE_ADMIN\tURL")
-	fmt.Fprintln(w, strings.Repeat("-", 80))
-
-	// Print each user
+	// Print header and each user
+	fmt.Fprintln(w, "ID\tLOGIN\tTYPE\tURL")
 	for _, user := range users {
-		fmt.Fprintf(w, "%d\t%s\t%s\n",
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\n",
 			user.ID,
 			user.Login,
 			user.Type,
+			user.URL,
 		)
+	}
+
+	// Flush the table before printing anything else, or the summary lands above the rows
+	if err := w.Flush(); err != nil {
+		return err
 	}
 
 	// Print summary
 	fmt.Printf("\nTotal users fetched: %d\n", len(users))
-
-	if len(users) > 0 {
-		fmt.Printf("Next since value: %d\n", users[len(users)-1].ID)
-	}
+	fmt.Printf("Next since value: %d\n", users[len(users)-1].ID)
 
 	return nil
 }

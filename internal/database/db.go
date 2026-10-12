@@ -2,12 +2,13 @@ package database
 
 import (
 	"fmt"
+	"log"
 	"time"
 
-	"github.com/blastjax/maya-golang/internal/config"
-	"github.com/blastjax/maya-golang/internal/github"
+	"github.com/blastjax/golang-redis/internal/config"
+	"github.com/blastjax/golang-redis/internal/github"
 
-	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -19,11 +20,15 @@ type DB struct {
 
 // New creates a new database connection using GORM
 func New(cfg *config.DatabaseConfig) (*DB, error) {
-	// Configure GORM logger level based on environment
-	gormLogger := logger.Default.LogMode(logger.Info)
-
-	db, err := gorm.Open(mysql.Open(cfg.GetDSN()), &gorm.Config{
-		Logger: gormLogger,
+	db, err := gorm.Open(postgres.Open(cfg.GetDSN()), &gorm.Config{
+		// Log slow queries and errors to stderr, so stdout stays clean for -format json
+		Logger: logger.New(log.Default(), logger.Config{
+			SlowThreshold:             200 * time.Millisecond,
+			LogLevel:                  logger.Warn,
+			IgnoreRecordNotFoundError: true,
+		}),
+		// Report unique constraint violations as gorm.ErrDuplicatedKey
+		TranslateError: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -59,6 +64,11 @@ func (db *DB) Close() error {
 
 // CreateSchema creates the necessary database schema using GORM auto-migration
 func (db *DB) CreateSchema() error {
+	// citext makes login comparisons case-insensitive, like GitHub logins
+	if err := db.Exec("CREATE EXTENSION IF NOT EXISTS citext").Error; err != nil {
+		return fmt.Errorf("failed to create citext extension: %w", err)
+	}
+
 	// Auto-migrate the User model
 	if err := db.AutoMigrate(&github.User{}); err != nil {
 		return fmt.Errorf("failed to auto-migrate schema: %w", err)
